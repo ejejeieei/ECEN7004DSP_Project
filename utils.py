@@ -153,10 +153,6 @@ def plot_spectrum(
 
     return dominant_freq, bandwidth_95, freqs, magnitudes
 
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.fft import fft, fftfreq
-from scipy import signal
 
 def plot_fixed_window_vary_length(
     eeg_signal: np.ndarray,
