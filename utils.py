@@ -1,8 +1,10 @@
 import mne
 import numpy as np
+import pywt
 import matplotlib.pyplot as plt
 from scipy.fft import fft, fftfreq
 from scipy import signal
+from scipy.signal import butter, filtfilt, find_peaks
 
 def load_eeg_segment(
     edf_path: str,
@@ -324,106 +326,380 @@ def add_interference_to_eeg(
     noisy_signal = eeg_signal + noise
     return noisy_signal, noise
 
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy import signal
 
-def design_and_apply_fir_bandstop(
-    noisy_signal: np.ndarray,
+def fir_notch(
+    freq: float,
     fs: float,
-    stopband: tuple = (8, 27),
-    passband_ripple: float = 0.1,
-    stopband_attenuation: float = 60,
-    plot_response: bool = True
-):
+    Q: float = 30.0,
+    numtaps: int = None
+) -> tuple:
     """
-    Design and apply an FIR band-stop filter to remove interference in [10, 25] Hz.
+    设计FIR陷波滤波器（带阻）
     
-    Parameters:
-        noisy_signal: Input noisy EEG
-        fs: Sampling frequency
-        stopband: (f_low, f_high) in Hz, e.g., (8, 27)
-        passband_ripple: Max ripple in passband (dB)
-        stopband_attenuation: Min attenuation in stopband (dB)
-        plot_response: Whether to plot filter characteristics
+    参数:
+    freq : 要陷波的中心频率 (Hz)
+    fs   : 采样频率 (Hz)
+    Q    : 品质因数 (Q = freq / bandwidth)，值越大，陷波越窄
+    numtaps : 滤波器阶数（长度）。若为None，自动估算
     
-    Returns:
-        filtered_signal, b (filter coefficients)
+    返回:
+    b, a : 滤波器系数（FIR，a=[1]）
     """
+    # 计算带宽
+    bandwidth = freq / Q
+    
+    # 避免带宽过窄导致滤波器阶数爆炸
+    min_bw = fs / 1000  # 最小带宽 0.1 Hz（可调）
+    bandwidth = max(bandwidth, min_bw)
+    
+    # 陷波频带边界
+    low = freq - bandwidth / 2
+    high = freq + bandwidth / 2
+    
+    # 频率不能超过奈奎斯特频率
     nyq = fs / 2
-    wp1 = 6 / nyq      # Lower passband edge
-    ws1 = stopband[0] / nyq   # Stopband start
-    ws2 = stopband[1] / nyq   # Stopband end
-    wp2 = 30 / nyq     # Upper passband edge (adjust if needed)
-
-    # Normalize frequencies
-    wp = [wp1, wp2]
-    ws = [ws1, ws2]
-
-    # Estimate filter order using kaiserord
-    delta_pass = (10**(passband_ripple/20) - 1) / (10**(passband_ripple/20) + 1)
-    delta_stop = 10**(-stopband_attenuation/20)
-    deltas = [delta_pass, delta_stop, delta_pass]
-    N, beta = signal.kaiserord(ripple=stopband_attenuation, width=(ws1 - wp1))
-    # Ensure even length for type I FIR (linear phase)
-    if N % 2 == 0:
-        N += 1
-
-    # Design band-stop FIR using firwin2 or remez (here use firwin with custom bands)
-    # Simpler: use signal.firwin with bandstop
+    if high >= nyq:
+        high = nyq - 1e-3
+    
+    if low <= 0:
+        low = 1e-3
+    
+    # 自动估算阶数（基于经验公式）
+    if numtaps is None:
+        # 过渡带 ≈ bandwidth / 10
+        trans_width = bandwidth / 10
+        numtaps = int(4 / trans_width * fs)  # 粗略估计
+        numtaps = numtaps if numtaps % 2 == 1 else numtaps + 1  # 必须为奇数
+    
+    # 设计带阻FIR滤波器
     b = signal.firwin(
-        numtaps=N,
-        cutoff=[stopband[0], stopband[1]],
-        window=('kaiser', beta),
+        numtaps,
+        [low, high],
         pass_zero='bandstop',
-        fs=fs
+        fs=fs,
+        window='hamming'
+    )
+    a = np.array([1.0])
+    return b, a
+
+
+def visu_threshold(coeffs, N):
+    sigma = np.median(np.abs(coeffs)) / 0.6745
+    return sigma * np.sqrt(2 * np.log(N))
+
+# 使用
+
+
+def optimal_eeg_denoise(
+    data:np.ndarray,
+    fs: float = 100.0,
+    notch_freqs:list=[10, 15, 20, 25]) -> np.ndarray:
+    # Step 1: FIR Notch Filter (无振铃)
+    for f in notch_freqs:
+        # b, a = fir_notch(f, fs, Q=40,numtaps=1001)  # FIR陷波，N=200保证陡峭过渡带
+        # data = signal.filtfilt(b, a, data)
+
+        b, a = fir_notch(f, fs, Q=20, numtaps=1001)
+        data = signal.filtfilt(b, a, data)
+    
+    # Step 2: Wavelet Denoising with BayesShrink
+    coeffs = pywt.wavedec(data, wavelet='sym5', level=2)
+    coeffs_thresh = []
+    for i, c in enumerate(coeffs):
+        if i == 0:  # Keep approximation
+            coeffs_thresh.append(c)
+        else:
+            # Use BayesShrink for colored noise robustness
+            T = visu_threshold(c, len(data))
+            c_thresh = pywt.threshold(c, value=T, mode='soft')
+            coeffs_thresh.append(c_thresh)
+
+    
+    denoised = pywt.waverec(coeffs_thresh, wavelet='sym5')
+    return denoised[:len(data)]
+    # return data
+
+    import numpy as np
+
+# 如果没有 vmdpy，可使用以下简易实现或安装：
+# pip install vmdpy
+from vmdpy import VMD
+
+def vmd_denoise(
+    data: np.ndarray,
+    fs: float = 100.0,
+    K: int = 8,      # 分解模态数
+    alpha: float = 2000,  # 正则化参数（越大越平滑）
+    tau: float = 0   # 噪声容忍度
+) -> np.ndarray:
+    """
+    使用VMD进行EEG去噪
+    """
+    # Step 1: FIR Notch Filter (先去除周期性干扰)
+    notch_freqs = [10, 15, 20, 25]
+    for f in notch_freqs:
+        # b, a = fir_notch(f, fs, Q=20, numtaps=1001)
+        # data = signal.filtfilt(b, a, data)
+
+        b, a = fir_notch(f, fs, Q=20, numtaps=1001)
+        data = signal.filtfilt(b, a, data)
+
+    # Step 2: VMD Decomposition
+    u, u_hat, omega = VMD(
+        data, 
+        alpha=alpha,     # 控制模态平滑度
+        tau=tau,         # 噪声容忍度
+        K=K,             # 模态数（覆盖0–35 Hz）
+        DC=False,        # 不包含直流分量
+        init=1,           # 初始化方式
+        tol=1e-7
     )
 
-    # Apply zero-phase filtering
-    filtered_signal = signal.filtfilt(b, [1.0], noisy_signal)
+    # Step 3: 重构 —— 保留前5个模态（低频+σ波），丢弃高频噪声模态
+    denoised = np.sum(u[:5], axis=0)
+    
+    return denoised[:len(data)]
 
-    if plot_response:
-        # Frequency response
-        w, h = signal.freqz(b, worN=4096, fs=fs)
-        fig, ax = plt.subplots(2, 2, figsize=(12, 8))
 
-        # Magnitude (dB)
-        ax[0, 0].plot(w, 20 * np.log10(np.abs(h)))
-        ax[0, 0].set_title('Magnitude Response')
-        ax[0, 0].set_xlabel('Frequency (Hz)')
-        ax[0, 0].set_ylabel('Magnitude (dB)')
-        ax[0, 0].grid()
-        ax[0, 0].axvspan(stopband[0], stopband[1], color='red', alpha=0.1, label='Stopband')
-        ax[0, 0].legend()
-
-        # Phase response
-        angles = np.unwrap(np.angle(h))
-        ax[0, 1].plot(w, angles)
-        ax[0, 1].set_title('Phase Response')
-        ax[0, 1].set_xlabel('Frequency (Hz)')
-        ax[0, 1].grid()
-
-        # Group delay
-        from scipy.signal import group_delay
-        w_gd, gd = group_delay((b, [1.0]), w=4096, fs=fs)
-        ax[1, 0].plot(w_gd, gd)
-        ax[1, 0].set_title('Group Delay')
-        ax[1, 0].set_xlabel('Frequency (Hz)')
-        ax[1, 0].set_ylabel('Samples')
-        ax[1, 0].grid()
-
-        # Pole-zero plot (FIR: all poles at origin)
-        zeros = np.roots(b)
-        ax[1, 1].scatter(np.real(zeros), np.imag(zeros), marker='o', label='Zeros')
-        ax[1, 1].scatter([0], [0], marker='x', s=100, label='Poles (origin)')
-        ax[1, 1].set_title('Pole-Zero Plot')
-        ax[1, 1].set_xlabel('Real')
-        ax[1, 1].set_ylabel('Imaginary')
-        ax[1, 1].grid()
-        ax[1, 1].axis('equal')
-        ax[1, 1].legend()
-
+def check_eeg_time_domain(
+    data: np.ndarray,
+    fs: float = 100.0,
+    segment_length: int = 10000,  # 100秒 @ 100Hz
+    plot: bool = True
+) -> dict:
+    """
+    检查EEG时域特征波形（δ, θ, α, σ, K-complex）
+    
+    返回:
+    results : dict 包含各波形的检测结果
+    """
+    results = {}
+    
+    # Step 1: 分段处理（避免长信号计算慢）
+    segments = []
+    for start in range(0, len(data), segment_length):
+        end = min(start + segment_length, len(data))
+        segments.append(data[start:end])
+    
+    # Step 2: 设计带通滤波器
+    def bandpass_filter(x, low, high, fs):
+        b, a = butter(4, [low/(fs/2), high/(fs/2)], btype='band')
+        return filtfilt(b, a, x)
+    
+    # Step 3: 检测各波形
+    for i, seg in enumerate(segments):
+        seg_results = {}
+        
+        # δ 波 (0.5–4 Hz)
+        delta = bandpass_filter(seg, 0.5, 4, fs)
+        seg_results['delta'] = {
+            'amplitude': np.max(np.abs(delta)),
+            'duration': len(delta) / fs,
+            'has_slow_wave': np.max(np.abs(delta)) > 0.5e-5  # 阈值可调
+        }
+        
+        # θ 波 (4–8 Hz)
+        theta = bandpass_filter(seg, 4, 8, fs)
+        seg_results['theta'] = {
+            'amplitude': np.max(np.abs(theta)),
+            'has_oscillation': np.std(theta) > 0.1e-5
+        }
+        
+        # α 波 (8–13 Hz)
+        alpha = bandpass_filter(seg, 8, 13, fs)
+        seg_results['alpha'] = {
+            'amplitude': np.max(np.abs(alpha)),
+            'has_rhythm': np.std(alpha) > 0.1e-5
+        }
+        
+        # σ 波 (12–16 Hz) - 纺锤波
+        sigma = bandpass_filter(seg, 12, 16, fs)
+        seg_results['sigma'] = {
+            'amplitude': np.max(np.abs(sigma)),
+            'spindle_count': 0,
+            'spindle_duration': 0
+        }
+        
+        # 检测纺锤波（基于包络和阈值）
+        envelope = np.abs(sigma)
+        threshold = np.percentile(envelope, 90)  # 90% 百分位作为阈值
+        peaks, _ = find_peaks(envelope, height=threshold, distance=int(fs*0.5))  # 最小间隔0.5s
+        
+        if len(peaks) > 0:
+            seg_results['sigma']['spindle_count'] = len(peaks)
+            durations = []
+            for p in peaks:
+                # 找到纺锤波起止点
+                left = p
+                while left > 0 and envelope[left] > threshold * 0.5:
+                    left -= 1
+                right = p
+                while right < len(envelope) and envelope[right] > threshold * 0.5:
+                    right += 1
+                durations.append((right - left) / fs)
+            seg_results['sigma']['spindle_duration'] = np.mean(durations) if durations else 0
+        
+        # K-复合波（基于 δ 波 + 瞬态检测）
+        k_complex = []
+        for j in range(len(delta)-100):
+            window = delta[j:j+100]
+            if np.max(np.abs(window)) > 0.8e-5 and np.std(window) > 0.3e-5:
+                k_complex.append(j)
+        
+        seg_results['k_complex'] = {
+            'count': len(k_complex),
+            'has_k_complex': len(k_complex) > 0
+        }
+        
+        results[f'segment_{i}'] = seg_results
+    
+    # Step 4: 可视化（可选）
+    if plot:
+        fig, axes = plt.subplots(3, 2, figsize=(12, 8))
+        axes = axes.flatten()
+        
+        for i, seg in enumerate(segments[:6]):  # 只画前6段
+            ax = axes[i]
+            t = np.arange(len(seg)) / fs
+            ax.plot(t, seg, linewidth=0.5, label='Raw')
+            
+            # 标注纺锤波
+            sigma_seg = bandpass_filter(seg, 12, 16, fs)
+            envelope = np.abs(sigma_seg)
+            threshold = np.percentile(envelope, 90)
+            peaks, _ = find_peaks(envelope, height=threshold, distance=int(fs*0.5))
+            for p in peaks:
+                ax.axvspan((p-20)/fs, (p+20)/fs, color='yellow', alpha=0.3, label='Spindle' if p==peaks[0] else "")
+            
+            ax.set_title(f'Segment {i}')
+            ax.set_xlabel('Time (s)')
+            ax.set_ylabel('Amplitude')
+            ax.legend(loc='upper right')
+        
         plt.tight_layout()
         plt.show()
+    
+    return results
 
-    return filtered_signal, b
+
+from scipy.signal import welch
+
+def compare_denoising(
+    original: np.ndarray,
+    denoised: np.ndarray,
+    fs: float = 100.0,
+    start_sec: int = 600,  # 从第10分钟开始（典型N2期）
+    duration_sec: int = 10,  # 显示10秒
+    save_path: str = None
+) -> dict:
+    """
+    对比原始信号与去噪信号的时域和频域特征
+    
+    参数:
+    original : 原始含噪信号
+    denoised : 去噪后信号
+    fs : 采样率 (Hz)
+    start_sec : 显示起始时间（秒）
+    duration_sec : 显示时长（秒）
+    save_path : 保存图像路径（如 'comparison.png'）
+    
+    返回:
+    metrics : dict 包含关键指标
+    """
+    # 1. 截取时域片段
+    start_idx = int(start_sec * fs)
+    end_idx = start_idx + int(duration_sec * fs)
+    t = np.arange(start_idx, end_idx) / fs - start_sec
+
+    orig_seg = original[start_idx:end_idx]
+    denoised_seg = denoised[start_idx:end_idx]
+
+    # 2. 计算PSD
+    nperseg = min(4096, len(original) // 4)  # 自适应分段长度
+    f_orig, psd_orig = welch(original, fs=fs, nperseg=nperseg)
+    f_denoised, psd_denoised = welch(denoised, fs=fs, nperseg=nperseg)
+
+    # 3. 计算95%带宽
+    def compute_95_bw(f, psd):
+        cumsum_psd = np.cumsum(psd)
+        threshold = 0.95 * cumsum_psd[-1]
+        idx_95 = np.where(cumsum_psd >= threshold)[0][0]
+        return f[idx_95]
+
+    bw_orig = compute_95_bw(f_orig, psd_orig)
+    bw_denoised = compute_95_bw(f_denoised, psd_denoised)
+
+    # 4. 计算σ波能量（12–16 Hz）
+    def compute_sigma_energy(f, psd):
+        mask = (f >= 12) & (f <= 16)
+        return np.sum(psd[mask]) if np.any(mask) else 0
+
+    sigma_orig = compute_sigma_energy(f_orig, psd_orig)
+    sigma_denoised = compute_sigma_energy(f_denoised, psd_denoised)
+
+    # 5. 估算信噪比（SNR）
+    # 假设原始信号 = 真实信号 + 噪声，去噪信号 ≈ 真实信号
+    noise_est = original - denoised
+    snr_db = 10 * np.log10(
+        np.var(denoised) / (np.var(noise_est) + 1e-12)
+    )
+
+    # 6. 绘图
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8))
+    fig.suptitle('EEG Denoising Comparison', fontsize=16)
+
+    # 时域波形（原始）
+    axes[0, 0].plot(t, orig_seg, color='gray', alpha=0.8, linewidth=0.8)
+    axes[0, 0].set_title('Original Signal (Time Domain)')
+    axes[0, 0].set_xlabel('Time (s)')
+    axes[0, 0].set_ylabel('Amplitude')
+    axes[0, 0].grid(True, linestyle='--', alpha=0.5)
+
+    # 时域波形（去噪）
+    axes[0, 1].plot(t, denoised_seg, color='tab:blue', linewidth=1.0)
+    axes[0, 1].set_title('Denoised Signal (Time Domain)')
+    axes[0, 1].set_xlabel('Time (s)')
+    axes[0, 1].set_ylabel('Amplitude')
+    axes[0, 1].grid(True, linestyle='--', alpha=0.5)
+
+    # 频域对比
+    axes[1, 0].semilogy(f_orig, psd_orig, color='gray', alpha=0.7, label='Original')
+    axes[1, 0].semilogy(f_denoised, psd_denoised, color='tab:blue', label='Denoised')
+    axes[1, 0].axvline(bw_orig, color='red', linestyle='--', alpha=0.7, label=f'95% BW: {bw_orig:.2f} Hz')
+    axes[1, 0].axvline(bw_denoised, color='green', linestyle='--', alpha=0.7, label=f'95% BW: {bw_denoised:.2f} Hz')
+    axes[1, 0].set_xlim(0, 30)
+    axes[1, 0].set_title('Power Spectral Density (PSD)')
+    axes[1, 0].set_xlabel('Frequency (Hz)')
+    axes[1, 0].set_ylabel('PSD [V²/Hz]')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, linestyle='--', alpha=0.5)
+
+    # 重点区域：σ波（12–16 Hz）
+    mask_focus = (f_denoised >= 10) & (f_denoised <= 20)
+    axes[1, 1].semilogy(f_denoised[mask_focus], psd_denoised[mask_focus], color='tab:blue', linewidth=1.2)
+    axes[1, 1].axvspan(12, 16, color='yellow', alpha=0.3, label='σ波 (12–16 Hz)')
+    axes[1, 1].set_title('Sigma Band (12–16 Hz)')
+    axes[1, 1].set_xlabel('Frequency (Hz)')
+    axes[1, 1].set_ylabel('PSD [V²/Hz]')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, linestyle='--', alpha=0.5)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Comparison plot saved to: {save_path}")
+    
+    plt.show()
+
+    # 7. 返回指标
+    metrics = {
+        'snr_db': snr_db,
+        'bandwidth_95_orig': bw_orig,
+        'bandwidth_95_denoised': bw_denoised,
+        'sigma_energy_orig': sigma_orig,
+        'sigma_energy_denoised': sigma_denoised,
+        'sigma_energy_ratio': sigma_denoised / (sigma_orig + 1e-12)
+    }
+
+    return metrics
